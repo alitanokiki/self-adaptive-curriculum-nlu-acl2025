@@ -1,0 +1,491 @@
+from sklearn.metrics import precision_recall_fscore_support
+import argparse
+import random
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, random_split, SubsetRandomSampler, Subset
+from torch.nn.utils.rnn import pad_sequence
+
+from transformers import (
+    BertModel, BertTokenizer, BertForMaskedLM,
+    RobertaTokenizer, RobertaForMaskedLM,
+    DistilBertTokenizer, DistilBertForMaskedLM,
+    AdamW, get_linear_schedule_with_warmup,
+    AutoModelForSequenceClassification,
+    set_seed as hf_set_seed
+)
+
+from datasets import load_dataset, Dataset
+from sklearn.model_selection import train_test_split
+from tqdm.auto import tqdm
+import matplotlib.pyplot as plt
+import os
+import logging
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    hf_set_seed(seed)
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--model_type', type=str, default='bert', choices=['bert', 'roberta', 'distilroberta'], help='Choose model: bert, roberta, distilroberta')
+parser.add_argument('--seed', type=int, default=66, help='Random seed')
+args = parser.parse_args()
+set_seed(args.seed)
+seed = args.seed
+learning_rate = 1e-5
+num_epochs = 5
+batch_size = 16
+data = 'sst2'
+strategie = 'basic'
+method = f'1e5_5_16_{strategie}_{args.model_type}_seed{args.seed}'
+
+if args.model_type == 'bert':
+    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+    model = BertForMaskedLM.from_pretrained('bert-base-uncased')
+elif args.model_type == 'roberta':
+    tokenizer = RobertaTokenizer.from_pretrained('roberta-base')
+    model = RobertaForMaskedLM.from_pretrained('roberta-base')
+elif args.model_type == 'distilroberta':
+    tokenizer = RobertaTokenizer.from_pretrained('distilroberta-base') 
+    model = RobertaForMaskedLM.from_pretrained('distilroberta-base')
+else:
+    raise ValueError(f"Unsupported model_type: {args.model_type}")
+
+label_words = {
+    0: ['bad'],
+    1: ["great"],
+}
+
+dataset = load_dataset("stanfordnlp/sst2")
+
+def tokenize_and_add_prompt(examples):
+    mask_token = tokenizer.mask_token
+    prompt_sentences = [sentence + f", this was a {mask_token} movie." for sentence in examples['sentence']]
+    return tokenizer(prompt_sentences, padding=False, truncation=True, max_length=128)
+
+tokenized_dataset = dataset.map(tokenize_and_add_prompt, batched=True)
+train_dataset = tokenized_dataset['train']
+test_dataset = tokenized_dataset['validation']
+
+print(f"✅ Loaded {args.model_type} with seed {args.seed}")
+
+verbalizer_ids = {}
+for label, words in label_words.items():
+    ids = []
+    for word in words:
+        word_ids = tokenizer.encode(word, add_special_tokens=False)
+        ids.extend(word_ids)
+    verbalizer_ids[label] = ids
+
+
+labels = train_dataset['label']
+
+positive_indices = [i for i, label in enumerate(labels) if label == 1]
+negative_indices = [i for i, label in enumerate(labels) if label == 0]
+
+train_pos_indices, valid_pos_indices = train_test_split(positive_indices, test_size=0.2, random_state=66)
+train_neg_indices, valid_neg_indices = train_test_split(negative_indices, test_size=0.2, random_state=66)
+
+valid_indices = valid_pos_indices + valid_neg_indices
+train_indices = train_pos_indices + train_neg_indices
+
+np.random.shuffle(train_indices)
+
+new_train_dataset = train_dataset.select(train_indices)
+eval_dataset = train_dataset.select(valid_indices)
+
+
+
+
+# Define sentiment words
+positive_words = ['great']
+negative_words = ['bad']
+ 
+positive_word_ids = tokenizer.convert_tokens_to_ids(positive_words)
+negative_word_ids = tokenizer.convert_tokens_to_ids(negative_words)
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model.to(device)
+
+def collate_fn(batch):
+    input_ids = pad_sequence([torch.tensor(item['input_ids']) for item in batch], batch_first=True, padding_value=tokenizer.pad_token_id)
+    attention_mask = pad_sequence([torch.tensor(item['attention_mask']) for item in batch], batch_first=True, padding_value=0)
+    labels = torch.tensor([item['label'] for item in batch])
+    return {'input_ids': input_ids, 'attention_mask': attention_mask, 'labels': labels}
+
+def calculate_sentiment_scores(batch):
+  input_ids = torch.tensor(batch['input_ids']).to(device)
+  attention_mask = torch.tensor(batch['attention_mask']).to(device)
+  with torch.no_grad():
+    outputs = model(input_ids, attention_mask=attention_mask)
+    predictions = outputs.logits
+  sentiment_scores = []
+  for i in range(predictions.shape[0]):
+    mask_token_indices = (input_ids[i] == tokenizer.mask_token_id).nonzero(as_tuple=True)
+    if mask_token_indices[0].size(0) == 0:
+      continue
+    masked_index = mask_token_indices[0].item()
+
+    logits_at_masked_position = predictions[i, masked_index]
+
+    positive_logits = logits_at_masked_position[positive_word_ids]
+    negative_logits = logits_at_masked_position[negative_word_ids]
+
+    combined_logits = torch.cat((positive_logits, negative_logits))
+    probabilities = torch.softmax(combined_logits, 0)
+
+    positive_prob_sum = torch.sum(probabilities[:len(positive_logits)])
+    negative_prob_sum = torch.sum(probabilities[len(positive_logits):])
+
+    total_prob_sum = positive_prob_sum + negative_prob_sum
+    positive_prob_normalized = positive_prob_sum / total_prob_sum
+    negative_prob_normalized = negative_prob_sum / total_prob_sum
+
+    # Calculate sentiment score
+    sentiment_score = torch.abs(positive_prob_normalized - negative_prob_normalized).item()
+    sentiment_scores.append(sentiment_score)
+  return sentiment_scores
+
+
+def calculate_initial_scores(dataset, tokenizer, model, device):
+   initial_scores = []
+
+   dataloader = DataLoader(dataset, batch_size=16, collate_fn=collate_fn)
+   model.eval()
+   with torch.no_grad():
+       for idx, batch in enumerate(tqdm(dataloader, desc="Calculating scores")):
+        batch_scores = calculate_sentiment_scores(batch)
+        for i, score in enumerate(batch_scores):
+            initial_scores.append((idx * 16 + i, score))  # Include the index along with the score
+   
+   return initial_scores
+
+
+train_loader = DataLoader(new_train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, generator=torch.Generator().manual_seed(seed))
+eval_loader = DataLoader(eval_dataset, batch_size=batch_size, collate_fn=collate_fn)
+
+
+optimizer = AdamW(model.parameters(), lr=1e-5)
+total_steps = len(train_loader) * num_epochs
+scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0, num_training_steps=total_steps)
+
+
+scores = calculate_initial_scores(new_train_dataset, tokenizer, model, device)
+score_values = [score for _, score in scores]
+
+plt.figure(figsize=(8, 6))
+counts, bins, patches = plt.hist(score_values, bins=10, edgecolor='black')
+for count, bin_edge in zip(counts, bins[:-1]):  
+    plt.text(bin_edge, count, str(int(count)), rotation=90, verticalalignment='bottom')
+plt.xlabel('Difficulty Score Range')
+plt.ylabel('Frequency')
+plt.title('Frequency Distribution of Sorted Difficulty Scores')
+
+plt.xticks(bins)
+plt.grid(axis='y', linestyle='--', alpha=0.7)
+plt.show()
+plt.savefig(f"{method}_{data}_1_{seed}")
+
+
+bins = [x / 10 for x in range(0, 11)]
+
+plt.figure(figsize=(8, 6))
+plt.hist(score_values, bins=bins, edgecolor='black', alpha=0.7)
+plt.xlabel('Difficulty Score Range')
+plt.ylabel('Frequency')
+plt.title('Frequency Distribution of Sorted Difficulty Scores')
+
+plt.xticks(bins)
+plt.grid(axis='y', linestyle='--', alpha=0.7)
+plt.show()
+plt.savefig(f"{method}_{data}_2_{seed}")
+
+plt.figure(figsize=(8, 6))
+counts, bins, patches = plt.hist(score_values, bins=4, edgecolor='black')
+
+for count, bin_edge in zip(counts, bins[:-1]):  
+    plt.text(bin_edge, count, str(int(count)), rotation=90, verticalalignment='bottom')
+plt.xlabel('Difficulty Score Range')
+plt.ylabel('Frequency')
+plt.title('Frequency Distribution of Sorted Difficulty Scores')
+
+plt.xticks(bins)
+plt.grid(axis='y', linestyle='--', alpha=0.7)
+plt.show()
+plt.savefig(f"{method}_{data}_3_{seed}")
+
+
+
+bins = [x / 4 for x in range(0, 5)]
+plt.figure(figsize=(8, 6))
+plt.hist(score_values, bins=bins, edgecolor='black', alpha=0.7)
+plt.xlabel('Difficulty Score Range')
+plt.ylabel('Frequency')
+plt.title('Frequency Distribution of Sorted Difficulty Scores')
+
+plt.xticks(bins)
+plt.grid(axis='y', linestyle='--', alpha=0.7)
+plt.show()
+plt.savefig(f"{method}_{data}_4_{seed}")
+
+
+
+
+
+logging.basicConfig(filename=f'{method}_{data}_{seed}.log', level=logging.INFO, format='%(message)s')
+logger = logging.getLogger()
+
+save_path = f'datathesis_{data}'
+os.makedirs(save_path, exist_ok=True)
+checkpoint_path = os.path.join(save_path, f"checkpoint_{method}_{data}_{seed}.pth")
+
+best_val_accuracy = 0
+best_model_path = os.path.join(save_path, f'best_model_{method}_{data}_{seed}.pth')
+
+start_epoch = 0
+if os.path.exists(checkpoint_path):
+    checkpoint = torch.load(checkpoint_path)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    start_epoch = checkpoint['epoch'] + 1
+    print(f"Resuming training from epoch {start_epoch}")
+
+for epoch in range(start_epoch, num_epochs):
+    model.train()
+    total_loss = 0
+    total_correct = 0
+    total_samples = 0
+
+    for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}"):
+        batch = {k: v.to(device) for k, v in batch.items()}
+        inputs, labels = batch['input_ids'], batch['labels']
+        outputs = model(input_ids=inputs, attention_mask=batch['attention_mask'], labels=inputs)
+        logits = outputs.logits
+
+        mask_token_index = (inputs == tokenizer.mask_token_id).nonzero(as_tuple=True)[1]
+        scores = torch.zeros(size=(len(labels), len(label_words)), device=device)
+
+        for i, idx in enumerate(mask_token_index):
+            logits_at_mask = logits[i, idx, :]
+            class_logits = []
+
+            for label, word_ids in verbalizer_ids.items():
+                logits_for_words = logits_at_mask[word_ids]
+                class_logits.append(logits_for_words)
+
+            all_logits = torch.cat(class_logits, dim=0)
+            probabilities = F.softmax(all_logits, dim=0)
+
+            start_index = 0
+            for label, word_ids in verbalizer_ids.items():
+                end_index = start_index + len(word_ids)
+                scores[i, label] = probabilities[start_index:end_index].sum()
+                start_index = end_index
+
+        log_scores = torch.log(scores + 1e-10)
+        loss = F.nll_loss(log_scores, labels)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+        predicted_labels = torch.argmax(scores, dim=1)
+        total_correct += (predicted_labels == labels).sum().item()
+        total_samples += len(labels)
+
+    avg_loss = total_loss / len(train_loader)
+    train_accuracy = total_correct / total_samples
+    print(f"Epoch {epoch+1}: Avg loss = {avg_loss}, Train Accuracy = {train_accuracy}")
+    logger.info(f"Epoch {epoch+1}: Avg loss = {avg_loss}, Train Accuracy = {train_accuracy}")
+
+    torch.save({
+    'epoch': epoch,
+    'model_state_dict': model.state_dict(),
+    'optimizer_state_dict': optimizer.state_dict(),
+    'scheduler_state_dict': scheduler.state_dict()}, checkpoint_path)
+
+    scores = calculate_initial_scores(new_train_dataset, tokenizer, model, device)
+    score_values = [score for _, score in scores]
+
+
+    plt.figure(figsize=(8, 6))
+    counts, bins, patches = plt.hist(score_values, bins=10, edgecolor='black')
+    for count, bin_edge in zip(counts, bins[:-1]):  
+        plt.text(bin_edge, count, str(int(count)), rotation=90, verticalalignment='bottom')
+    plt.xlabel('Difficulty Score Range')
+    plt.ylabel('Frequency')
+    plt.title('Frequency Distribution of Sorted Difficulty Scores')
+
+    plt.xticks(bins)
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    plt.show()
+    plt.savefig(f"{method}_{data}_{seed}_epoch{epoch+1}_1")
+
+    bins = [x / 10 for x in range(0, 11)]
+
+    plt.figure(figsize=(8, 6))
+    plt.hist(score_values, bins=bins, edgecolor='black', alpha=0.7)
+    plt.xlabel('Difficulty Score Range')
+    plt.ylabel('Frequency')
+    plt.title('Frequency Distribution of Sorted Difficulty Scores')
+
+    plt.xticks(bins)
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    plt.show()
+    plt.savefig(f"{method}_{data}_{seed}_epoch{epoch+1}_2")
+    
+    plt.figure(figsize=(8, 6))
+    counts, bins, patches = plt.hist(score_values, bins=4, edgecolor='black')
+
+    for count, bin_edge in zip(counts, bins[:-1]):  
+        plt.text(bin_edge, count, str(int(count)), rotation=90, verticalalignment='bottom')
+    plt.xlabel('Difficulty Score Range')
+    plt.ylabel('Frequency')
+    plt.title('Frequency Distribution of Sorted Difficulty Scores')
+
+    plt.xticks(bins)
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    plt.show()
+    plt.savefig(f"{method}_{data}_{seed}_epoch{epoch+1}_3")
+
+    bins = [x / 4 for x in range(0, 5)]
+
+    plt.figure(figsize=(8, 6))
+    plt.hist(score_values, bins=bins, edgecolor='black', alpha=0.7)
+    plt.xlabel('Difficulty Score Range')
+    plt.ylabel('Frequency')
+    plt.title('Frequency Distribution of Sorted Difficulty Scores')
+
+    plt.xticks(bins)
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    plt.show()
+    plt.savefig(f"{method}_{data}_{seed}_epoch{epoch+1}_4")
+
+ 
+
+
+    
+    model.eval()
+    eval_loss = 0
+    eval_correct = 0
+    eval_samples = 0
+    with torch.no_grad():
+        for batch in eval_loader:
+            batch = {k: v.to(device) for k, v in batch.items()}
+            inputs, labels = batch['input_ids'], batch['labels']
+            outputs = model(input_ids=inputs, attention_mask=batch['attention_mask'], labels=inputs)
+            logits = outputs.logits
+
+            mask_token_index = (inputs == tokenizer.mask_token_id).nonzero(as_tuple=True)[1]
+            scores = torch.zeros(size=(len(labels), len(label_words)), device=device)
+
+            for i, idx in enumerate(mask_token_index):
+                logits_at_mask = logits[i, idx, :]
+                class_logits = []
+
+                for label, word_ids in verbalizer_ids.items():
+                    logits_for_words = logits_at_mask[word_ids]
+                    class_logits.append(logits_for_words)
+
+
+                all_logits = torch.cat(class_logits, dim=0)
+                probabilities = F.softmax(all_logits, dim=0)
+
+                start_index = 0
+                for label, word_ids in verbalizer_ids.items():
+                    end_index = start_index + len(word_ids)
+                    scores[i, label] = probabilities[start_index:end_index].sum()
+                    start_index = end_index
+
+            log_scores = torch.log(scores + 1e-10)
+            loss = F.nll_loss(log_scores, labels)
+
+            eval_loss += loss.item()
+            predicted_labels = torch.argmax(scores, dim=1)
+            eval_correct += (predicted_labels == labels).sum().item()
+            eval_samples += len(labels)
+
+    avg_eval_loss = eval_loss / len(eval_loader)
+    eval_accuracy = eval_correct / eval_samples
+    print(f"Epoch {epoch+1}: Avg Eval Loss = {avg_eval_loss}, Eval Accuracy = {eval_accuracy}")
+    logger.info(f"Epoch {epoch+1}: Avg Eval Loss = {avg_eval_loss}, Eval Accuracy = {eval_accuracy}")
+    
+ 
+     # Save the best model
+    if eval_accuracy > best_val_accuracy:
+        best_val_accuracy = eval_accuracy
+        torch.save(model.state_dict(), best_model_path)
+
+
+print("Training complete.")
+
+
+# Create data loaders for training and validation
+test_loader = DataLoader(test_dataset, batch_size=batch_size, collate_fn=collate_fn)
+
+# Load the best model
+model.load_state_dict(torch.load(best_model_path))
+
+model.eval()
+
+test_loss = 0
+test_correct = 0
+test_samples = 0
+all_labels = []
+all_predictions = []
+with torch.no_grad():
+    for batch in test_loader:
+        batch = {k: v.to(device) for k, v in batch.items()}
+        inputs, labels = batch['input_ids'], batch['labels']
+        outputs = model(input_ids=inputs, attention_mask=batch['attention_mask'], labels=inputs)
+        logits = outputs.logits
+
+        mask_token_index = (inputs == tokenizer.mask_token_id).nonzero(as_tuple=True)[1]
+        scores = torch.zeros(size=(len(labels), len(label_words)), device=device)
+
+        for i, idx in enumerate(mask_token_index):
+            logits_at_mask = logits[i, idx, :]
+            class_logits = []
+
+            for label, word_ids in verbalizer_ids.items():
+                logits_for_words = logits_at_mask[word_ids]
+                class_logits.append(logits_for_words)
+
+            all_logits = torch.cat(class_logits, dim=0)
+            probabilities = F.softmax(all_logits, dim=0)
+
+            start_index = 0
+            for label, word_ids in verbalizer_ids.items():
+                end_index = start_index + len(word_ids)
+                scores[i, label] = probabilities[start_index:end_index].sum()
+                start_index = end_index
+
+        log_scores = torch.log(scores + 1e-10)
+        loss = F.nll_loss(log_scores, labels)
+
+        test_loss += loss.item()
+        predicted_labels = torch.argmax(scores, dim=1)
+        test_correct += (predicted_labels == labels).sum().item()
+        test_samples += len(labels)
+        all_labels.extend(labels.cpu().numpy())
+        all_predictions.extend(predicted_labels.cpu().numpy())
+
+avg_test_loss = test_loss / len(test_loader)
+test_accuracy = test_correct / test_samples
+
+# Calculate precision, recall, f1-score
+precision, recall, f1, _ = precision_recall_fscore_support(all_labels, all_predictions, average='macro')
+
+print(f"Avg Test Loss = {avg_test_loss}, Test Accuracy = {test_accuracy}")
+print(f"Precision = {precision}, Recall = {recall}, F1 Score = {f1}")
+logger.info(f"Avg Test Loss = {avg_test_loss}, Test Accuracy = {test_accuracy}")
